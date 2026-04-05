@@ -1,38 +1,31 @@
 const express = require('express');
-const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DATA_FILE = path.join(__dirname, 'data', 'responses.json');
+const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://natzek:PassWord123@psychsoc.hvjugcu.mongodb.net/?appName=psychsoc';
+const DB_NAME = 'study';
+const COLLECTION = 'responses';
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Initialize data file
-if (!fs.existsSync(path.join(__dirname, 'data'))) {
-  fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
-}
-if (!fs.existsSync(DATA_FILE)) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify([]));
+let db;
+
+async function connectDB() {
+  const client = new MongoClient(MONGO_URI);
+  await client.connect();
+  db = client.db(DB_NAME);
+  console.log('Connected to MongoDB');
 }
 
-function loadResponses() {
-  try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
-  catch { return []; }
-}
-function saveResponses(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
-
-// Generate a new worker ID
 app.get('/api/worker-id', (req, res) => {
   res.json({ workerId: 'W-' + uuidv4().split('-')[0].toUpperCase() });
 });
 
-// Submit a single trial response
-app.post('/api/response', (req, res) => {
+app.post('/api/response', async (req, res) => {
   const {
     workerId, condition, trialId, questionId, subject,
     humanAnswer, groundTruth, isCorrect,
@@ -44,7 +37,6 @@ app.post('/api/response', (req, res) => {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  const responses = loadResponses();
   const entry = {
     timestamp: new Date().toISOString(),
     workerId, condition, trialId, questionId, subject,
@@ -56,60 +48,60 @@ app.post('/api/response', (req, res) => {
     aiAnswer: aiAnswer ?? null,
     aiWasHelpful: aiWasHelpful ?? null
   };
-  responses.push(entry);
-  saveResponses(responses);
+
+  await db.collection(COLLECTION).insertOne(entry);
   res.json({ ok: true });
 });
 
-// Submit session summary (completion)
-app.post('/api/session', (req, res) => {
-  const responses = loadResponses();
-  // Tag all entries for this worker with session end time
+app.post('/api/session', async (req, res) => {
   const { workerId, totalTimeMs } = req.body;
-  responses.forEach(r => {
-    if (r.workerId === workerId && !r.sessionTotalTimeMs) {
-      r.sessionTotalTimeMs = totalTimeMs;
-    }
-  });
-  saveResponses(responses);
+  await db.collection(COLLECTION).updateMany(
+    { workerId, sessionTotalTimeMs: { $exists: false } },
+    { $set: { sessionTotalTimeMs: totalTimeMs } }
+  );
   res.json({ ok: true });
 });
 
-// Admin: get all data as JSON
-app.get('/api/admin/data', (req, res) => {
-  const responses = loadResponses();
-  res.json(responses);
+app.get('/api/admin/data', async (req, res) => {
+  const data = await db.collection(COLLECTION).find({}, { projection: { _id: 0 } }).toArray();
+  res.json(data);
 });
 
-// Admin: download as CSV
-app.get('/api/admin/csv', (req, res) => {
-  const responses = loadResponses();
-  if (responses.length === 0) {
-    return res.send('No data yet.');
-  }
-  const headers = Object.keys(responses[0]);
+app.get('/api/admin/csv', async (req, res) => {
+  const data = await db.collection(COLLECTION).find({}, { projection: { _id: 0 } }).toArray();
+  if (data.length === 0) return res.send('No data yet.');
+
+  const headers = ['timestamp','workerId','condition','trialId','questionId','subject',
+    'humanAnswer','groundTruth','isCorrect','confidenceRating','timeSpentMs',
+    'aiShown','aiAnswer','aiWasHelpful','sessionTotalTimeMs'];
+
   const csv = [
     headers.join(','),
-    ...responses.map(r =>
+    ...data.map(r =>
       headers.map(h => {
         const v = r[h] ?? '';
         return String(v).includes(',') ? `"${v}"` : v;
       }).join(',')
     )
   ].join('\n');
+
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="study_responses.csv"');
   res.send(csv);
 });
 
-// Admin page
 app.get('/admin', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`Study server running at http://localhost:${PORT}`);
-  console.log(`  Baseline:  http://localhost:${PORT}/baseline.html`);
-  console.log(`  AI-Assist: http://localhost:${PORT}/ai.html`);
-  console.log(`  Admin:     http://localhost:${PORT}/admin`);
+connectDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Study server running at http://localhost:${PORT}`);
+    console.log(`  Baseline:  http://localhost:${PORT}/baseline.html`);
+    console.log(`  AI-Assist: http://localhost:${PORT}/ai.html`);
+    console.log(`  Admin:     http://localhost:${PORT}/admin`);
+  });
+}).catch(err => {
+  console.error('Failed to connect to MongoDB:', err);
+  process.exit(1);
 });
